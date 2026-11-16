@@ -1,0 +1,211 @@
+"""Semantic memory using Mem0.
+
+Stores agent-level facts and learned knowledge. Auto-deduplicates.
+This is the "gets smarter over time" piece.
+
+Example facts stored:
+- "NVIDIA P/E is 58 as of March 2026"
+- "Users asking about tech stocks usually want risk assessment"
+- "AMD and NVIDIA are direct competitors in GPU market"
+
+Mem0 automatically:
+- Extracts facts from text
+- Merges duplicate facts
+- Updates stale facts with newer info
+"""
+
+import logging
+import os
+import shutil
+
+from mem0 import Memory
+
+logger = logging.getLogger(__name__)
+
+
+class SemanticMemory:
+    """Mem0-backed agent fact store.
+
+    PYTHON CONCEPT — composition vs inheritance:
+    We WRAP Mem0's Memory class instead of inheriting from it.
+    self.memory = Memory()  ← composition (HAS-A)
+    class SemanticMemory(Memory)  ← inheritance (IS-A) — DON'T do this
+
+    Why? Composition is more flexible. If Mem0's API changes, you only
+    update this wrapper. Your agents never touch Mem0 directly.
+    Same principle in TS/Rust: prefer composition over inheritance.
+    """
+
+    def __init__(self, config: dict | None = None):
+        """Initialize Mem0.
+
+        PYTHON CONCEPT — dict | None = None:
+        Same as `config?: Record<string, any>` in TS.
+        The `| None` means it can be None, `= None` makes it optional.
+
+        Mem0 config can specify which LLM/embedding to use.
+        None = use Mem0's defaults.
+        """
+        if not config:
+            config = {
+                "embedder": {
+                    "provider": "huggingface",
+                    "config": {"model": "all-MiniLM-L6-v2"},
+                },
+            }
+        self._config = config
+        self._did_dimension_recovery = False
+        self.memory = Memory.from_config(self._config)
+
+        logger.info("Semantic memory (Mem0) initialized")
+
+    @staticmethod
+    def _is_dimension_mismatch(error: Exception) -> bool:
+        """Detect embedding/vector dimension mismatch errors from Mem0/Qdrant."""
+        msg = str(error).lower()
+        return (
+            "not aligned" in msg
+            or "vector size" in msg
+            or "dimension" in msg
+            or "shapes (" in msg
+        )
+
+    def _reset_local_mem0_vector_store(self) -> None:
+        """Reset local Mem0 qdrant storage to rebuild with current embedding size.
+
+        This is a developer-safety recovery path for local mismatched stores
+        (for example old 1536-d vectors with current 384-d embedder).
+        """
+        mem0_dir = os.path.expanduser("~/.mem0")
+        qdrant_migrations_dir = os.path.join(mem0_dir, "migrations_qdrant")
+        history_db = os.path.join(mem0_dir, "history.db")
+
+        removed_any = False
+        if os.path.isdir(qdrant_migrations_dir):
+            shutil.rmtree(qdrant_migrations_dir, ignore_errors=True)
+            removed_any = True
+
+        # Mem0 keeps metadata/history in SQLite locally; clearing it avoids
+        # stale vector metadata that can still reference old dimensions.
+        if os.path.isfile(history_db):
+            try:
+                os.remove(history_db)
+                removed_any = True
+            except OSError:
+                pass
+
+        if removed_any:
+            logger.warning(
+                "Semantic memory mismatch detected. Reset local Mem0 storage at %s",
+                mem0_dir,
+            )
+
+    def _recover_from_dimension_mismatch(self, error: Exception) -> bool:
+        """Attempt one-time recovery from local vector dimension mismatch."""
+        if self._did_dimension_recovery or not self._is_dimension_mismatch(error):
+            return False
+
+        self._did_dimension_recovery = True
+        self._reset_local_mem0_vector_store()
+        self.memory = Memory.from_config(self._config)
+        logger.warning(
+            "Semantic memory reinitialized after vector dimension mismatch; retrying operation once."
+        )
+        return True
+
+    def store(self, content: str, agent_name: str, metadata: dict | None = None) -> dict:
+        """Store a fact. Mem0 auto-deduplicates.
+
+        If you store "NVIDIA P/E is 65" and later store "NVIDIA P/E is 58",
+        Mem0 updates the old fact instead of creating a duplicate.
+
+        Args:
+            content: The fact or knowledge to store.
+            agent_name: Which agent learned this (used as user_id in Mem0).
+            metadata: Extra context (query, topic, etc.).
+
+        Returns:
+            Mem0's response with the stored/updated memory ID.
+
+        PYTHON CONCEPT — `metadata or {}`:
+        None or {} → returns {}
+        {"key": "val"} or {} → returns {"key": "val"}
+        Python's `or` returns the first truthy value.
+        Same as `metadata ?? {}` in TS.
+        """
+        try:
+            result = self.memory.add(
+                content,
+                user_id=agent_name,
+                metadata=metadata or {},
+            )
+        except Exception as e:
+            if self._recover_from_dimension_mismatch(e):
+                result = self.memory.add(
+                    content,
+                    user_id=agent_name,
+                    metadata=metadata or {},
+                )
+            else:
+                raise
+        logger.info("Stored fact for %s: %s", agent_name, content[:80])
+        return result
+
+    def search(self, query: str, agent_name: str | None = None, limit: int = 5) -> list[dict]:
+        """Search facts by meaning.
+
+        Args:
+            query: Natural language query.
+            agent_name: Filter to facts learned by this agent. None = search all.
+            limit: Max results.
+
+        Returns:
+            List of matching facts with scores.
+
+        PYTHON CONCEPT — **kwargs (keyword argument unpacking):
+        `**kwargs` unpacks a dict as function arguments.
+        TS equivalent: fn({ query, limit, ...rest })
+        Rust: no direct equivalent
+
+        Example:
+            kwargs = {"query": "NVIDIA", "limit": 5}
+            self.memory.search(**kwargs)
+            # same as: self.memory.search(query="NVIDIA", limit=5)
+        """
+        kwargs: dict = {"query": query, "limit": limit}
+        kwargs["user_id"] = agent_name or "system"
+
+        try:
+            results = self.memory.search(**kwargs)
+        except Exception as e:
+            if self._recover_from_dimension_mismatch(e):
+                results = self.memory.search(**kwargs)
+            else:
+                raise
+        return results.get("results", [])
+        # ^ .get("results", []) = safe access with fallback
+        #   TS equivalent: results?.results ?? []
+
+    def get_all(self, agent_name: str) -> list[dict]:
+        """Get all facts stored by a specific agent.
+
+        Useful for: "What does the researcher agent know?"
+        """
+        result = self.memory.get_all(user_id=agent_name)
+        return result.get("results", [])
+
+    def delete(self, memory_id: str) -> None:
+        """Delete a specific fact by its ID."""
+        self.memory.delete(memory_id)
+        logger.info("Deleted memory: %s", memory_id)
+
+    def delete_all(self, agent_name: str) -> None:
+        """Delete all facts for an agent. Use carefully.
+
+        PYTHON CONCEPT — dangerous methods:
+        In production, name dangerous methods clearly.
+        Some teams prefix with `dangerous_` or require confirmation.
+        At minimum, log a warning.
+        """
+        logger.warning("Deleting ALL memories for agent: %s", agent_name)
+        self.memory.delete_all(user_id=agent_name)

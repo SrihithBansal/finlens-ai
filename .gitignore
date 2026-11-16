@@ -1,0 +1,28 @@
+# Makefile runtime files
+.fastapi.pid
+.fastapi.log
+.streamlit.pid
+.streamlit.log
+
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+venv/
+
+# Local caches and operating system files
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.DS_Store
+
+# env files
+.env
+.env.*
+!.env.example
